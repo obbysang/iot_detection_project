@@ -1,0 +1,12 @@
+data/
+models/
+*.pcap
+*.csv
+*.pkl
+*.joblib
+*.keras
+*.json
+*.png
+__pycache__/
+*.pyc
+venv/

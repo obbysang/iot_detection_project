@@ -1,0 +1,55 @@
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: mqtt-broker
+    hostname: mqtt-broker
+    networks:
+      iot_sim_net:
+        ipv4_address: 192.168.50.10
+    volumes:
+      - ./docker/mqtt-broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  iot-web:
+    image: nginx:alpine
+    container_name: iot-web
+    hostname: iot-web
+    networks:
+      iot_sim_net:
+        ipv4_address: 192.168.50.11
+
+  iot-sensor:
+    build:
+      context: ./docker/iot-sensor
+    container_name: iot-sensor
+    hostname: iot-sensor
+    networks:
+      iot_sim_net:
+        ipv4_address: 192.168.50.20
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./data:/data
+    depends_on:
+      - mqtt-broker
+      - iot-web
+
+  attacker:
+    build:
+      context: ./docker/attacker
+    container_name: attacker
+    hostname: attacker
+    networks:
+      iot_sim_net:
+        ipv4_address: 192.168.50.99
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./data:/data
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+networks:
+  iot_sim_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.50.0/24
