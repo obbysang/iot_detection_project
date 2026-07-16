@@ -175,15 +175,20 @@ def main():
     X = df[available_features].values
     y = df[label_col].values
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    train_idx, test_idx = train_test_split(
+        df.index, test_size=0.2, random_state=42, stratify=y
     )
+
+    X_train = df.loc[train_idx, available_features].values
+    X_test = df.loc[test_idx, available_features].values
+    y_train = df.loc[train_idx, label_col].values
+    y_test = df.loc[test_idx, label_col].values
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    holdout = df.iloc[y_test.index].copy()
+    holdout = df.loc[test_idx].copy()
     holdout_path = os.path.join(args.outdir, "holdout_test_set.csv")
     holdout.to_csv(holdout_path, index=False)
     print(f"[+] Saved holdout test set: {holdout_path}", file=sys.stderr)

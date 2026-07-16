@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -18,7 +18,7 @@ def parse_attack_log(log_path):
                 continue
             timestamp_str, event, src_ip, dst_ip = parts[:4]
             try:
-                ts = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+                ts = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
             except ValueError:
                 continue
 

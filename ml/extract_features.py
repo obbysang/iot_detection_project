@@ -69,7 +69,7 @@ def compute_features(flow_packets):
     for key, pkts in flow_packets.items():
         src_ip, src_port, dst_ip, dst_port, proto = key
 
-        timestamps = np.array([p.time for p in pkts])
+        timestamps = np.array([float(p.time) for p in pkts])
         sizes = np.array([len(p) for p in pkts])
 
         duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0

@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir paho-mqtt
+RUN pip install --default-timeout=300 --no-cache-dir paho-mqtt
 
 RUN useradd -m iotuser && echo 'iotuser:iotpass123' | chpasswd
 

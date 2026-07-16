@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IoT NIDS · Control Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-base: #0B1120;
+  --bg-surface: #111827;
+  --bg-elevated: #1E293B;
+  --bg-hover: #273449;
+  --border: #1E293B;
+  --border-light: #2D3A4E;
+  --text-primary: #F1F5F9;
+  --text-secondary: #94A3B8;
+  --text-muted: #64748B;
+  --accent-green: #22C55E;
+  --accent-red: #EF4444;
+  --accent-blue: #3B82F6;
+  --accent-yellow: #EAB308;
+  --accent-cyan: #06B6D4;
+  --accent-purple: #A855F7;
+  --normal-bg: rgba(34,197,94,0.12);
+  --attack-bg: rgba(239,68,68,0.12);
+  --radius: 4px;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+html { font-size: 13px; }
+body {
+  font-family: var(--font);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  line-height: 1.5;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Top Nav ── */
+.top-nav {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+.top-nav .brand {
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.top-nav .brand span { color: var(--accent-cyan); }
+.top-nav .phase-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.phase-badge .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+@keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.phase-badge.attacking .dot { background: var(--accent-red); }
+.phase-badge.training .dot { background: var(--accent-yellow); }
+.phase-badge.idle .dot { background: var(--text-muted); animation:none; }
+
+.top-nav .clock {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+.top-nav .proto-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.proto-legend .proto-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.proto-item .swatch {
+  width: 8px; height: 8px;
+  border-radius: 2px;
+}
+
+/* ── Main Layout ── */
+.main-content { flex: 1; overflow-y: auto; padding: 16px 24px 32px; }
+
+/* ── KPI Strip ── */
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.kpi-card {
+  background: var(--bg-surface);
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kpi-card .kpi-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.kpi-card .kpi-value {
+  font-family: var(--mono);
+  font-size: 1.65rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+.kpi-card .kpi-sub {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+.kpi-card .kpi-trend {
+  font-size: 0.7rem;
+  font-weight: 500;
+}
+.kpi-trend.up { color: var(--accent-green); }
+.kpi-trend.down { color: var(--accent-red); }
+.kpi-card.accent-blue .kpi-value { color: var(--accent-blue); }
+.kpi-card.accent-green .kpi-value { color: var(--accent-green); }
+.kpi-card.accent-red .kpi-value { color: var(--accent-red); }
+.kpi-card.accent-cyan .kpi-value { color: var(--accent-cyan); }
+.kpi-card.accent-yellow .kpi-value { color: var(--accent-yellow); }
+
+/* ── Split Pane ── */
+.split-pane {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 16px;
+  height: 340px;
+}
+.pane-left, .pane-right {
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.pane-header h3 {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.pane-header .pane-ctrl {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  background: none;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+  cursor: pointer;
+  font-family: var(--font);
+  transition: all 0.15s;
+}
+.pane-header .pane-ctrl:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.pane-body {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+#timeChart { width: 100% !important; height: 100% !important; }
+
+/* ── Event Stream ── */
+.event-stream {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  line-height: 1.6;
+}
+.event-entry {
+  display: flex;
+  gap: 8px;
+  padding: 2px 14px;
+  transition: background 0.2s;
+}
+.event-entry:hover { background: var(--bg-hover); }
+.event-entry .evt-time {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 66px;
+}
+.event-entry .evt-level {
+  flex-shrink: 0;
+  width: 44px;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.6rem;
+  letter-spacing: 0.04em;
+}
+.evt-level.info { color: var(--accent-blue); }
+.evt-level.warn { color: var(--accent-yellow); }
+.evt-level.error { color: var(--accent-red); }
+.evt-level.ok { color: var(--accent-green); }
+.evt-level.attack { color: var(--accent-red); }
+.event-entry .evt-msg {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.event-entry .evt-msg .highlight { color: var(--accent-cyan); }
+.event-entry .evt-msg .alert { color: var(--accent-red); font-weight: 600; }
+
+/* ── Table Section ── */
+.table-section {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.table-toolbar h3 {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-right: auto;
+}
+.table-toolbar .filter-group {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.filter-group label {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.filter-group select, .filter-group input {
+  background: var(--bg-base);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 0.7rem;
+  padding: 3px 8px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.filter-group select:focus, .filter-group input:focus {
+  border-color: var(--accent-blue);
+}
+.filter-group select option { background: var(--bg-elevated); }
+.table-toolbar .flow-count {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  font-family: var(--mono);
+}
+.table-wrap {
+  overflow-x: auto;
+  max-height: 360px;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.data-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-elevated);
+  padding: 7px 10px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-light);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+.data-table th:hover { color: var(--text-primary); }
+.data-table th.sorted { color: var(--accent-cyan); }
+.data-table th .sort-icon {
+  display: inline-block;
+  margin-left: 4px;
+  opacity: 0.4;
+}
+.data-table th.sorted .sort-icon { opacity: 1; }
+.data-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  transition: background 0.15s;
+}
+.data-table tr:hover td { background: var(--bg-hover); }
+.data-table td.num { font-family: var(--mono); text-align: right; }
+.data-table .label-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 2px;
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.label-badge.normal { background: var(--normal-bg); color: var(--accent-green); }
+.label-badge.recon { background: rgba(234,179,8,0.15); color: var(--accent-yellow); }
+.label-badge.bruteforce { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+.label-badge.c2_beacon { background: rgba(168,85,247,0.15); color: var(--accent-purple); }
+.label-badge.exfil_ransomware { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+.data-table .proto-badge {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-weight: 500;
+}
+.data-table tr.attack-row td { background: rgba(239,68,68,0.04); }
+.data-table tr.attack-row:hover td { background: rgba(239,68,68,0.1); }
+
+/* ── Control Panel ── */
+.control-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.ctrl-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ctrl-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-right: 2px;
+}
+.ctrl-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--border-light);
+  margin: 0 4px;
+}
+.ctrl-btn {
+  font-family: var(--font);
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 4px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--accent-green);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.ctrl-btn:hover { background: var(--bg-hover); border-color: var(--accent-green); }
+.ctrl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.ctrl-btn.running { color: var(--accent-red); border-color: var(--accent-red); }
+.ctrl-btn.running:hover { border-color: var(--accent-red); }
+.ctrl-btn.attack { color: var(--accent-yellow); }
+.ctrl-btn.attack:hover { border-color: var(--accent-yellow); }
+
+/* Utility */
+.flex-center { display: flex; align-items: center; gap: 6px; }
+.text-mono { font-family: var(--mono); }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<!-- ─── NAV ─── -->
+<nav class="top-nav">
+  <div class="brand">IOT<span>NIDS</span></div>
+  <div class="phase-badge" id="phaseBadge">
+    <span class="dot"></span>
+    <span id="phaseLabel">RUNNING</span>
+  </div>
+  <div class="proto-legend">
+    <span class="proto-item"><span class="swatch" style="background:#3B82F6"></span>MQTT</span>
+    <span class="proto-item"><span class="swatch" style="background:#22C55E"></span>HTTP</span>
+    <span class="proto-item"><span class="swatch" style="background:#EAB308"></span>SSH</span>
+    <span class="proto-item"><span class="swatch" style="background:#A855F7"></span>ICMP</span>
+    <span class="proto-item"><span class="swatch" style="background:#EF4444"></span>ATTACK</span>
+  </div>
+  <div class="clock" id="clock">--:--:--</div>
+</nav>
+
+<!-- ─── MAIN ─── -->
+<div class="main-content">
+
+  <!-- KPI Strip -->
+  <div class="kpi-strip">
+    <div class="kpi-card accent-cyan">
+      <span class="kpi-label">Throughput</span>
+      <span class="kpi-value" id="kpiThroughput">--</span>
+      <span class="kpi-sub" id="kpiThroughputSub">pkt/s</span>
+    </div>
+    <div class="kpi-card accent-blue">
+      <span class="kpi-label">Active Flows</span>
+      <span class="kpi-value" id="kpiFlows">--</span>
+      <span class="kpi-sub" id="kpiFlowsSub">concurrent</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Avg Anomaly Score</span>
+      <span class="kpi-value" id="kpiAnomaly">--</span>
+      <span class="kpi-sub" id="kpiAnomalySub">threshold: 0.150</span>
+    </div>
+    <div class="kpi-card accent-green">
+      <span class="kpi-label">Detection Rate</span>
+      <span class="kpi-value" id="kpiDetection">--</span>
+      <span class="kpi-sub" id="kpiDetectionSub">last 5 min</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Model F1 Score</span>
+      <span class="kpi-value" id="kpiF1">--</span>
+      <span class="kpi-sub" id="kpiF1Sub">RF · LSTM · AE</span>
+    </div>
+  </div>
+
+  <!-- Control Panel -->
+  <div id="controlPanel" class="control-strip"></div>
+
+  <!-- Split Pane -->
+  <div class="split-pane">
+    <div class="pane-left">
+      <div class="pane-header">
+        <h3>Network Activity · Last 60s</h3>
+        <button class="pane-ctrl" id="chartToggle">pkts/s</button>
+      </div>
+      <div class="pane-body">
+        <canvas id="timeChart"></canvas>
+      </div>
+    </div>
+    <div class="pane-right">
+      <div class="pane-header">
+        <h3>Event Stream</h3>
+        <span style="font-size:0.65rem;color:var(--text-muted);font-family:var(--mono)" id="evtCount">0 events</span>
+      </div>
+      <div class="event-stream" id="eventStream"></div>
+    </div>
+  </div>
+
+  <!-- Data Table -->
+  <div class="table-section">
+    <div class="table-toolbar">
+      <h3>Active Flows</h3>
+      <div class="filter-group">
+        <label>Proto</label>
+        <select id="filterProto">
+          <option value="">All</option>
+          <option value="MQTT">MQTT</option>
+          <option value="HTTP">HTTP</option>
+          <option value="SSH">SSH</option>
+          <option value="ICMP">ICMP</option>
+          <option value="OTHER">OTHER</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>Label</label>
+        <select id="filterLabel">
+          <option value="">All</option>
+          <option value="NORMAL">Normal</option>
+          <option value="RECON">Recon</option>
+          <option value="BRUTEFORCE">Brute Force</option>
+          <option value="C2_BEACON">C2 Beacon</option>
+          <option value="EXFIL_RANSOMWARE">Exfil</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>Search</label>
+        <input type="text" id="filterSearch" placeholder="IP, port..." style="width:140px">
+      </div>
+      <span class="flow-count" id="flowCount">0 flows</span>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table" id="flowTable">
+        <thead>
+          <tr>
+            <th data-col="src_ip">Src IP <span class="sort-icon">▲</span></th>
+            <th data-col="src_port">Port <span class="sort-icon">▲</span></th>
+            <th data-col="dst_ip">Dst IP <span class="sort-icon">▲</span></th>
+            <th data-col="dst_port">Port <span class="sort-icon">▲</span></th>
+            <th data-col="proto">Proto <span class="sort-icon">▲</span></th>
+            <th data-col="total_packets" class="num">Pkts <span class="sort-icon">▲</span></th>
+            <th data-col="total_bytes" class="num">Bytes <span class="sort-icon">▲</span></th>
+            <th data-col="pkts_per_sec" class="num">Pkt/s <span class="sort-icon">▲</span></th>
+            <th data-col="bytes_per_sec" class="num">B/s <span class="sort-icon">▲</span></th>
+            <th data-col="duration" class="num">Dur <span class="sort-icon">▲</span></th>
+            <th data-col="dst_ip_entropy" class="num">Entropy <span class="sort-icon">▲</span></th>
+            <th data-col="label">Label <span class="sort-icon">▲</span></th>
+          </tr>
+        </thead>
+        <tbody id="flowBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script src="dist/dashboard.js"></script>
+</body>
+</html>

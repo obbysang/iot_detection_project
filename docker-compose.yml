@@ -47,6 +47,32 @@ services:
       - NET_ADMIN
       - NET_RAW
 
+  dashboard-api:
+    build:
+      context: .
+      dockerfile: docker/dashboard-api/Dockerfile
+    container_name: dashboard-api
+    hostname: dashboard-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./dashboard:/app/dashboard
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./scripts:/app/scripts:ro
+      - ./ml:/app/ml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+
+  capture:
+    build:
+      context: ./docker/capture
+    container_name: iot-capture
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./data/segments:/data/segments
+
 networks:
   iot_sim_net:
     driver: bridge

@@ -133,8 +133,7 @@ def evaluate_lstm(model, X_test, y_test, outdir):
 
 
 def evaluate_autoencoder(model, X_test, y_test, threshold, scaler, outdir):
-    le = LabelEncoder()
-    y_test_bin = le.fit_transform(y_test)
+    y_test_bin = np.array([0 if l == "NORMAL" else 1 for l in y_test])
 
     reconstructions = model.predict(X_test, verbose=0)
     errors = np.mean(np.square(X_test - reconstructions), axis=1)
