@@ -7,26 +7,7 @@
 - sudo access for host-based packet capture (optional — capture runs in Docker)
 - npm / pnpm (for building the dashboard frontend)
 
-## 0. Fix Known Bugs (Required — Ship Has These)
 
-Two source files need patches that are **not yet merged upstream**. Apply them before proceeding:
-
-### Patch A — Timezone bug in label_flows.py
-
-**File:** `ml/label_flows.py`
-**Line 4:** change `from datetime import datetime` → `from datetime import datetime, timezone`
-**Line 21:** change `.timestamp()` → `.replace(tzinfo=timezone.utc).timestamp()`
-
-Without this, attack timestamps in `attack_log.csv` are parsed in your **local timezone** instead of UTC, so flow timestamps (always UTC) will never overlap with attack intervals, and **every flow will be labeled NORMAL**.
-
-### Patch B — numpy/scapy type crash in extract_features.py
-
-**File:** `ml/extract_features.py`
-**Line 72:** change `np.array([p.time for p in pkts])` → `np.array([float(p.time) for p in pkts])`
-
-`p.time` returns a scapy `EDecimal` which crashes when numpy tries to divide it. The `float()` cast fixes it.
-
-**Verify both patches are applied before proceeding.** If you pull fresh source, reapply them.
 
 ## 1. Install Dependencies
 
