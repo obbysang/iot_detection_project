@@ -190,7 +190,7 @@ def compute_kpis(df: pd.DataFrame, evaluation: dict) -> dict:
 
     avg_anomaly = 0.0
     if "dst_ip_entropy" in df.columns:
-        anomaly_mask = df["label"] != "NORMAL" if "label" in df.columns else pd.Series([False] * n)
+        anomaly_mask = df["label"] != "NORMAL" if "label" in df.columns else pd.Series(False, index=df.index)
         anomaly_scores = df["dst_ip_entropy"].copy()
         anomaly_scores[anomaly_mask] *= 0.12
         anomaly_scores[~anomaly_mask] *= 0.02
@@ -273,7 +273,7 @@ def compute_timeline(df: pd.DataFrame) -> dict:
         pkts.append(round(avg_pkts, 1))
 
         if "dst_ip_entropy" in bucket_df.columns:
-            mask = bucket_df["label"] != "NORMAL" if "label" in bucket_df.columns else pd.Series([False] * len(bucket_df))
+            mask = bucket_df["label"] != "NORMAL" if "label" in bucket_df.columns else pd.Series(False, index=bucket_df.index)
             scores = bucket_df["dst_ip_entropy"].copy()
             scores[mask] *= 0.12
             scores[~mask] *= 0.02
@@ -297,7 +297,7 @@ async def control_capture_start():
         seg_dir = "/data/segments"
         result = subprocess.run(
             ["docker", "exec", "iot-capture", "sh", "-c",
-             f"nohup tcpdump -i any -G 30 -W 500 -w {seg_dir}/capture.pcap -n > /dev/null 2>&1 &"],
+             f"nohup tcpdump -i any -n net 192.168.50.0/24 -G 30 -W 500 -w {seg_dir}/capture.pcap > /dev/null 2>&1 &"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:

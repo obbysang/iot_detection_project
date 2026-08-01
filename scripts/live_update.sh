@@ -39,6 +39,7 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 SEG_SINCE_TRAIN=0
+LAST_LOG_MTIME=""
 
 echo "[live] Watching $SEG_DIR for new pcap segments (train every $TRAIN_EVERY)"
 
@@ -81,7 +82,16 @@ while true; do
         NEW_COUNT=$((NEW_COUNT + 1))
     done < <(find "$SEG_DIR" -maxdepth 1 -name 'capture.pcap*' -print0 2>/dev/null)
 
-    if [ "$NEW_COUNT" -gt 0 ] && [ -f "$ATTACK_LOG" ]; then
+    LOG_MTIME="$(stat -c %Y "$ATTACK_LOG" 2>/dev/null || echo 0)"
+    LABEL_NEEDED=0
+    [ "$NEW_COUNT" -gt 0 ] && LABEL_NEEDED=1
+    if [ -n "$LAST_LOG_MTIME" ] && [ "$LOG_MTIME" != "$LAST_LOG_MTIME" ]; then
+        echo "[live] Attack log changed -- re-labeling"
+        LABEL_NEEDED=1
+    fi
+    LAST_LOG_MTIME="$LOG_MTIME"
+
+    if [ "$LABEL_NEEDED" -eq 1 ] && [ -f "$ATTACK_LOG" ]; then
         echo "[live] Labeling flows..."
         python3 ml/label_flows.py --flows "$FLOWS_CSV" --log "$ATTACK_LOG" --out "$LABELED_CSV"
     fi
