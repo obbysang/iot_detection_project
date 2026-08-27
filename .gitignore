@@ -17,3 +17,13 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+
+# Docs / reports
+docs/*
+!docs/*.md
+~$*
+*.docx
+*.doc
+
+# Generated ML evaluation evidence (track)
+!results/**

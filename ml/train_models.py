@@ -1,108 +1,91 @@
 #!/usr/bin/env python3
+"""Authoritative training pipeline (Random Forest, LSTM, Autoencoder).
+
+Corrected evaluation methodology:
+  - stratified 80/20 split (random_state=42)
+  - StandardScaler fitted on TRAINING data only, saved to models/scaler.joblib
+  - one persistent label encoder saved to models/label_encoder.joblib
+  - LSTM sequences built independently per partition AFTER the split
+    (no sequence crosses the train/test boundary)
+  - Autoencoder trained on TRAINING normal flows only; threshold =
+    mean + 3*std of reconstruction errors on those same training flows
+"""
 import argparse
-import sys
 import json
 import os
-from collections import defaultdict
+import sys
+from datetime import datetime, timezone
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+import pandas as pd
+import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score
-import joblib
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pipeline_common import (
+    FEATURE_COLS, LABEL_COL, RANDOM_STATE, SEQ_LEN,
+    load_labeled_data, make_split, build_sequences, save_label_encoder,
+)
 
 
-def train_random_forest(X_train, y_train, X_test, y_test, outdir):
+def train_random_forest(X_train, y_train):
     print("[*] Training Random Forest...", file=sys.stderr)
     rf = RandomForestClassifier(
         n_estimators=200,
         max_depth=20,
         min_samples_split=5,
         class_weight="balanced",
-        random_state=42,
+        random_state=RANDOM_STATE,
         n_jobs=-1,
     )
     rf.fit(X_train, y_train)
-    y_pred = rf.predict(X_test)
-    f1 = f1_score(y_test, y_pred, average="weighted")
-    print(f"[+] RF F1 (weighted): {f1:.4f}", file=sys.stderr)
-    path = os.path.join(outdir, "random_forest.joblib")
-    joblib.dump(rf, path)
-    print(f"[+] Saved: {path}", file=sys.stderr)
     return rf
 
 
-def build_lstm_sequences(df, feature_cols, seq_len=5):
-    sequences = []
-    labels = []
-    label_map = {}
-    for src_ip, group in df.groupby("src_ip"):
-        group = group.sort_values("start_time")
-        for i in range(len(group) - seq_len + 1):
-            seq = group.iloc[i : i + seq_len]
-            last_label = seq["label"].iloc[-1]
-            X_vals = seq[feature_cols].values.astype(np.float64)
-            sequences.append(X_vals)
-            labels.append(last_label)
-    if len(sequences) == 0:
-        return np.array([]), np.array([]), {}
-    all_labels = sorted(set(labels))
-    label_map = {l: i for i, l in enumerate(all_labels)}
-    return np.array(sequences), np.array(labels), label_map
-
-
-def train_lstm(X_train_seq, y_train_seq, X_test_seq, y_test_seq, outdir, num_classes):
+def train_lstm(X_train_seq, y_train_seq, num_classes):
     try:
+        import random
         import tensorflow as tf
         from tensorflow import keras
         from tensorflow.keras import layers
     except ImportError:
         print("[!] TensorFlow not installed -- skipping LSTM", file=sys.stderr)
-        print("    Install: pip install tensorflow", file=sys.stderr)
         return None
 
-    flatten_dim = X_train_seq.shape[2]
+    tf.keras.utils.set_random_seed(RANDOM_STATE)
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:
+        pass
+
     model = keras.Sequential([
-        layers.Input(shape=(X_train_seq.shape[1], flatten_dim)),
+        layers.Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
         layers.LSTM(64, return_sequences=False),
         layers.Dense(32, activation="relu"),
         layers.Dense(num_classes, activation="softmax"),
     ])
-    model.compile(
-        optimizer="adam",
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    model.fit(
-        X_train_seq, y_train_seq,
-        epochs=20,
-        batch_size=16,
-        validation_split=0.1,
-        verbose=0,
-    )
-    y_pred = np.argmax(model.predict(X_test_seq, verbose=0), axis=1)
-    f1 = f1_score(y_test_seq, y_pred, average="weighted")
-    print(f"[+] LSTM F1 (weighted): {f1:.4f}", file=sys.stderr)
-    path = os.path.join(outdir, "lstm_model.keras")
-    model.save(path)
-    print(f"[+] Saved: {path}", file=sys.stderr)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    model.fit(X_train_seq, y_train_seq, epochs=20, batch_size=16,
+              validation_split=0.1, verbose=0)
     return model
 
 
-def train_autoencoder(X_train_norm, X_test, y_test, outdir):
+def train_autoencoder(X_train_norm):
     try:
         import tensorflow as tf
         from tensorflow import keras
         from tensorflow.keras import layers
     except ImportError:
         print("[!] TensorFlow not installed -- skipping Autoencoder", file=sys.stderr)
-        print("    Install: pip install tensorflow", file=sys.stderr)
         return None
 
+    tf.keras.utils.set_random_seed(RANDOM_STATE)
     input_dim = X_train_norm.shape[1]
     model = keras.Sequential([
         layers.Input(shape=(input_dim,)),
@@ -112,37 +95,8 @@ def train_autoencoder(X_train_norm, X_test, y_test, outdir):
         layers.Dense(input_dim, activation="linear"),
     ])
     model.compile(optimizer="adam", loss="mse")
-    model.fit(
-        X_train_norm, X_train_norm,
-        epochs=30,
-        batch_size=16,
-        validation_split=0.1,
-        verbose=0,
-    )
-
-    reconstructions = model.predict(X_train_norm, verbose=0)
-    errors = np.mean(np.square(X_train_norm - reconstructions), axis=1)
-    threshold = float(np.mean(errors) + 3 * np.std(errors))
-
-    test_reconstructions = model.predict(X_test, verbose=0)
-    test_errors = np.mean(np.square(X_test - test_reconstructions), axis=1)
-    y_pred_ae = (test_errors > threshold).astype(int)
-
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    y_test_bin = le.fit_transform(y_test)
-    f1 = f1_score(y_test_bin, y_pred_ae, average="weighted")
-    print(f"[+] Autoencoder F1 (weighted): {f1:.4f}", file=sys.stderr)
-
-    model_path = os.path.join(outdir, "autoencoder_model.keras")
-    model.save(model_path)
-    print(f"[+] Saved: {model_path}", file=sys.stderr)
-
-    threshold_path = os.path.join(outdir, "autoencoder_threshold.json")
-    with open(threshold_path, "w") as f:
-        json.dump({"threshold": threshold}, f)
-    print(f"[+] Saved: {threshold_path}", file=sys.stderr)
-
+    model.fit(X_train_norm, X_train_norm, epochs=30, batch_size=16,
+              validation_split=0.1, verbose=0)
     return model
 
 
@@ -155,77 +109,120 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"[*] Loading data: {args.data}", file=sys.stderr)
-    df = pd.read_csv(args.data)
+    df = load_labeled_data(args.data)
+    n_total = len(df)
+    class_dist = df[LABEL_COL].value_counts().to_dict()
+    print(f"[+] {n_total} flows; class distribution: {class_dist}", file=sys.stderr)
 
-    label_col = "label"
-    feature_cols = [
-        "duration", "total_packets", "total_bytes",
-        "fwd_packets", "bwd_packets", "fwd_bytes", "bwd_bytes",
-        "mean_pkt_len", "std_pkt_len", "mean_iat", "std_iat",
-        "pkts_per_sec", "bytes_per_sec", "uncommon_port", "dst_ip_entropy",
-    ]
+    # ---- Split FIRST (stratified, deterministic) ----
+    train_idx, test_idx = make_split(df)
+    y_all = df[LABEL_COL].values
+    X_train = df.loc[train_idx, FEATURE_COLS].values.astype(np.float64)
+    X_test = df.loc[test_idx, FEATURE_COLS].values.astype(np.float64)
+    y_train = df.loc[train_idx, LABEL_COL].values
+    y_test = df.loc[test_idx, LABEL_COL].values
+    print(f"[+] Train: {len(train_idx)}  Test: {len(test_idx)}", file=sys.stderr)
 
-    drop_cols = [c for c in feature_cols if c not in df.columns]
-    if drop_cols:
-        print(f"[!] Missing columns: {drop_cols}", file=sys.stderr)
-
-    available_features = [c for c in feature_cols if c in df.columns]
-    print(f"[+] Using {len(available_features)} features: {available_features}", file=sys.stderr)
-
-    X = df[available_features].values
-    y = df[label_col].values
-
-    train_idx, test_idx = train_test_split(
-        df.index, test_size=0.2, random_state=42, stratify=y
-    )
-
-    X_train = df.loc[train_idx, available_features].values
-    X_test = df.loc[test_idx, available_features].values
-    y_train = df.loc[train_idx, label_col].values
-    y_test = df.loc[test_idx, label_col].values
-
+    # ---- Scaler fitted on training data ONLY ----
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+    joblib.dump(scaler, os.path.join(args.outdir, "scaler.joblib"))
+    print("[+] Saved: models/scaler.joblib", file=sys.stderr)
 
-    holdout = df.loc[test_idx].copy()
-    holdout_path = os.path.join(args.outdir, "holdout_test_set.csv")
-    holdout.to_csv(holdout_path, index=False)
-    print(f"[+] Saved holdout test set: {holdout_path}", file=sys.stderr)
+    # ---- One authoritative label encoder (fit on training labels) ----
+    le = LabelEncoder()
+    le.fit(y_train)
+    label_mapping = {str(c): int(i) for i, c in enumerate(le.classes_)}
+    save_label_encoder(le, args.outdir)
+    print(f"[+] Label mapping: {label_mapping}", file=sys.stderr)
 
-    scaler_path = os.path.join(args.outdir, "scaler.joblib")
-    joblib.dump(scaler, scaler_path)
-    print(f"[+] Saved scaler: {scaler_path}", file=sys.stderr)
+    # Persist holdout test set so evaluate.py uses exactly this partition.
+    df.loc[test_idx].to_csv(os.path.join(args.outdir, "holdout_test_set.csv"), index=False)
 
-    rf_model = train_random_forest(X_train_scaled, y_train, X_test_scaled, y_test, args.outdir)
+    metadata = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "random_seed": RANDOM_STATE,
+        "test_size": 0.2,
+        "stratified": True,
+        "feature_count": len(FEATURE_COLS),
+        "features": list(FEATURE_COLS),
+        "label_mapping": label_mapping,
+        "total_flows": int(n_total),
+        "training_flows": int(len(train_idx)),
+        "testing_flows": int(len(test_idx)),
+        "class_distribution_total": {k: int(v) for k, v in class_dist.items()},
+        "class_distribution_train": {k: int(v) for k, v in pd.Series(y_train).value_counts().items()},
+        "class_distribution_test": {k: int(v) for k, v in pd.Series(y_test).value_counts().items()},
+        "lstm_sequence_length": SEQ_LEN,
+        "rf_params": {"n_estimators": 200, "max_depth": 20,
+                      "min_samples_split": 5, "class_weight": "balanced"},
+        "lstm_params": {"units": 64, "dense": 32, "epochs": 20, "batch_size": 16},
+        "ae_params": {"layers": [16, 8, 16], "epochs": 30, "batch_size": 16},
+    }
 
-    y_test_numeric = pd.factorize(y_test)[0]
-    y_train_numeric = pd.factorize(y_train)[0]
-    num_classes = len(np.unique(y_test_numeric))
+    # ---- Random Forest (train partition only) ----
+    rf = train_random_forest(X_train_scaled, y_train)
+    joblib.dump(rf, os.path.join(args.outdir, "random_forest.joblib"))
+    f1_rf = f1_score(y_test, rf.predict(X_test_scaled), average="weighted")
+    print(f"[+] RF weighted F1 (holdout): {f1_rf:.4f}", file=sys.stderr)
+    metadata["rf_holdout_weighted_f1"] = float(f1_rf)
 
-    lstm_data = df[[c for c in df.columns if c in available_features] + ["src_ip", "start_time", "label"]].copy()
-    lstm_data = lstm_data.dropna(subset=available_features)
+    # ---- LSTM: sequences built AFTER the split, per partition ----
+    train_part = df.loc[train_idx]
+    test_part = df.loc[test_idx]
+    X_tr_seq, y_tr_lab = build_sequences(train_part, scaler=scaler)
+    X_te_seq, y_te_lab = build_sequences(test_part, scaler=scaler)
+    y_tr_ids = le.transform(y_tr_lab) if len(y_tr_lab) else np.array([])
+    y_te_ids = le.transform(y_te_lab) if len(y_te_lab) else np.array([])
+    print(f"[+] LSTM sequences -- train: {len(X_tr_seq)}, test: {len(X_te_seq)}",
+          file=sys.stderr)
+    metadata["lstm_training_sequences"] = int(len(X_tr_seq))
+    metadata["lstm_testing_sequences"] = int(len(X_te_seq))
+    metadata["lstm_sequence_class_distribution_train"] = {
+        str(k): int(v) for k, v in pd.Series(y_tr_lab).value_counts().items()} if len(y_tr_lab) else {}
+    metadata["lstm_sequence_class_distribution_test"] = {
+        str(k): int(v) for k, v in pd.Series(y_te_lab).value_counts().items()} if len(y_te_lab) else {}
 
-    seqs, seq_labels, label_map = build_lstm_sequences(lstm_data, available_features, seq_len=5)
-    if len(seqs) < 20:
-        print(f"[!] Only {len(seqs)} LSTM sequences (< 20) -- skipping LSTM", file=sys.stderr)
-        print("    Capture more traffic per device or repeat attacks more times.", file=sys.stderr)
+    if len(X_tr_seq) >= 20 and len(np.unique(y_tr_ids)) > 1:
+        lstm_model = train_lstm(X_tr_seq, y_tr_ids, num_classes=len(le.classes_))
+        if lstm_model is not None:
+            lstm_model.save(os.path.join(args.outdir, "lstm_model.keras"))
+            pred = np.argmax(lstm_model.predict(X_te_seq, verbose=0), axis=1)
+            f1_lstm = f1_score(y_te_ids, pred, average="weighted")
+            print(f"[+] LSTM weighted F1 (holdout): {f1_lstm:.4f}", file=sys.stderr)
+            metadata["lstm_holdout_weighted_f1"] = float(f1_lstm)
     else:
-        label_ids = np.array([label_map[l] for l in seq_labels])
-        train_seqs, test_seqs, train_slabels, test_slabels = train_test_split(
-            seqs, label_ids, test_size=0.2, random_state=42
-        )
-        lstm_num_classes = len(label_map)
-        lstm_model = train_lstm(train_seqs, train_slabels, test_seqs, test_slabels, args.outdir, lstm_num_classes)
+        print("[!] Not enough LSTM training sequences/classes -- skipping LSTM",
+              file=sys.stderr)
 
-    normal_mask = df[label_col] == "NORMAL"
-    if normal_mask.sum() > 0:
-        X_norm = df[normal_mask][available_features].values
-        X_norm_scaled = scaler.transform(X_norm)
-        ae_model = train_autoencoder(X_norm_scaled, X_test_scaled, y_test, args.outdir)
-    else:
-        print("[!] No NORMAL flows found -- skipping Autoencoder", file=sys.stderr)
+    # ---- Autoencoder: TRAINING normal flows only, threshold from them only ----
+    normal_mask = pd.Series(y_train) == "NORMAL"
+    X_train_norm = X_train_scaled[normal_mask.values]
+    print(f"[+] Autoencoder training on {X_train_norm.shape[0]} NORMAL training flows",
+          file=sys.stderr)
+    ae_model = train_autoencoder(X_train_norm)
+    if ae_model is not None:
+        recon = ae_model.predict(X_train_norm, verbose=0)
+        errors = np.mean(np.square(X_train_norm - recon), axis=1)
+        threshold = float(np.mean(errors) + 3 * np.std(errors))
+        with open(os.path.join(args.outdir, "autoencoder_threshold.json"), "w") as f:
+            json.dump({
+                "threshold": threshold,
+                "rule": "mean + 3 * std of per-flow reconstruction error",
+                "computed_on": "TRAINING partition NORMAL flows only",
+                "n_training_normal": int(X_train_norm.shape[0]),
+                "mean_error": float(np.mean(errors)),
+                "std_error": float(np.std(errors)),
+            }, f, indent=2)
+        ae_model.save(os.path.join(args.outdir, "autoencoder_model.keras"))
+        print(f"[+] Autoencoder threshold: {threshold:.6g} (saved)", file=sys.stderr)
+        metadata["autoencoder_threshold"] = threshold
+        metadata["autoencoder_training_normal_samples"] = int(X_train_norm.shape[0])
 
+    with open(os.path.join(args.outdir, "training_metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+    print("[+] Saved: models/training_metadata.json", file=sys.stderr)
     print("[+] Training complete", file=sys.stderr)
 
 

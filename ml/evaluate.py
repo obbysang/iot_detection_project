@@ -1,273 +1,349 @@
 #!/usr/bin/env python3
+"""Authoritative final evaluation entry point.
+
+Loads saved models, scaler, label encoder and Autoencoder threshold.
+NEVER retrains, NEVER fits the scaler, NEVER regenerates the label
+mapping, NEVER recomputes the Autoencoder threshold.
+
+Outputs all results into results/run_YYYYMMDD_HHMMSS/ and copies the
+canonical result files to results/.
+"""
 import argparse
-import os
-import sys
 import json
+import os
+import shutil
+import sys
+from datetime import datetime, timezone
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+
 import matplotlib
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import seaborn as sns
-import pandas as pd
 import numpy as np
+import pandas as pd
 import joblib
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    confusion_matrix,
-    f1_score,
-    roc_auc_score,
-    roc_curve,
-    auc,
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, precision_recall_fscore_support,
 )
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pipeline_common import (
+    FEATURE_COLS, LABEL_COL, RANDOM_STATE, SEQ_LEN, TEST_SIZE,
+    load_labeled_data, make_split, build_sequences,
+)
 
-def load_models(outdir):
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+
+
+def load_artifacts(outdir):
+    scaler = joblib.load(os.path.join(outdir, "scaler.joblib"))
+    le = joblib.load(os.path.join(outdir, "label_encoder.joblib"))
+    with open(os.path.join(outdir, "autoencoder_threshold.json")) as f:
+        threshold = json.load(f)["threshold"]
     models = {}
     rf_path = os.path.join(outdir, "random_forest.joblib")
     if os.path.exists(rf_path):
-        from sklearn.ensemble import RandomForestClassifier
         models["random_forest"] = joblib.load(rf_path)
-
-    lstm_path = os.path.join(outdir, "lstm_model.keras")
-    if os.path.exists(lstm_path):
-        try:
-            from tensorflow import keras
+    try:
+        from tensorflow import keras
+        lstm_path = os.path.join(outdir, "lstm_model.keras")
+        if os.path.exists(lstm_path):
             models["lstm"] = keras.models.load_model(lstm_path)
-        except Exception as e:
-            print(f"[!] Could not load LSTM model: {e}", file=sys.stderr)
-
-    ae_path = os.path.join(outdir, "autoencoder_model.keras")
-    if os.path.exists(ae_path):
-        try:
-            from tensorflow import keras
+        ae_path = os.path.join(outdir, "autoencoder_model.keras")
+        if os.path.exists(ae_path):
             models["autoencoder"] = keras.models.load_model(ae_path)
-        except Exception as e:
-            print(f"[!] Could not load Autoencoder model: {e}", file=sys.stderr)
-
-    return models
-
-
-def load_threshold(outdir):
-    thresh_path = os.path.join(outdir, "autoencoder_threshold.json")
-    if os.path.exists(thresh_path):
-        with open(thresh_path) as f:
-            return json.load(f)["threshold"]
-    return None
+    except ImportError:
+        print("[!] TensorFlow not available -- LSTM/AE evaluation skipped", file=sys.stderr)
+    return scaler, le, threshold, models
 
 
-def evaluate_rf(model, X_test, y_test, outdir):
-    le = LabelEncoder()
-    y_test_enc = le.fit_transform(y_test)
-    num_classes = len(le.classes_)
+def get_test_set(args, outdir):
+    """Return (X_test_df_rows, y_test) using the saved holdout partition."""
+    df = None
+    if getattr(args, "data", None):
+        df = load_labeled_data(args.data)
+        train_idx, test_idx = make_split(df)  # deterministic reproduction
+        test_part = df.loc[test_idx]
+        holdout_path = os.path.join(outdir, "holdout_test_set.csv")
+        if os.path.exists(holdout_path):
+            holdout = pd.read_csv(holdout_path)
+            same = len(holdout) == len(test_part) and np.allclose(
+                holdout[FEATURE_COLS].values, test_part[FEATURE_COLS].values,
+                rtol=1e-12, atol=0)
+            if same:
+                print("[*] Holdout file verified against reproduced split",
+                      file=sys.stderr)
+            else:
+                print("[!] Holdout file differs from reproduced split -- "
+                      "using reproduced split", file=sys.stderr)
+        return test_part, test_part[LABEL_COL].values
+    holdout_path = os.path.join(outdir, "holdout_test_set.csv")
+    if not os.path.exists(holdout_path):
+        raise SystemExit("ERROR: no --data given and no holdout_test_set.csv found")
+    holdout = pd.read_csv(holdout_path)
+    return holdout, holdout[LABEL_COL].values
 
-    y_pred = model.predict(X_test)
-    y_pred_enc = le.transform(y_pred) if hasattr(le, "transform") else y_pred
-    # handle case where y_pred contains unseen labels
-    try:
-        y_pred_enc = le.transform(y_pred)
-    except:
-        y_pred_enc = np.array([le.transform([p])[0] if p in le.classes_ else -1 for p in y_pred])
 
-    y_prob = model.predict_proba(X_test)
-
-    cm = confusion_matrix(y_test_enc, y_pred_enc, labels=range(num_classes))
-    f1 = f1_score(y_test_enc, y_pred_enc, average="weighted")
-
-    if num_classes == 2:
-        roc_auc = roc_auc_score(y_test_enc, y_prob[:, 1])
-    else:
-        try:
-            roc_auc = roc_auc_score(y_test_enc, y_prob, multi_class="ovr")
-        except:
-            roc_auc = float("nan")
-
-    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else float("nan")
-
-    save_confusion_matrix(cm, le.classes_, "Random Forest", outdir, "rf_confusion_matrix.png")
-
+def classification_dict(y_true, y_pred, le):
+    acc = accuracy_score(y_true, y_pred)
+    p_mac = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    r_mac = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f_mac = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    p_wtd = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    r_wtd = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    f_wtd = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    class_labels = list(le.classes_)
+    prec, rec, f1s, sup = precision_recall_fscore_support(
+        y_true, y_pred, labels=class_labels, zero_division=0)
+    per_class = {}
+    for i, cls in enumerate(class_labels):
+        per_class[str(cls)] = {"precision": float(prec[i]), "recall": float(rec[i]),
+                               "f1": float(f1s[i]), "support": int(sup[i])}
     return {
-        "model": "random_forest",
-        "f1_score": f1,
-        "roc_auc": roc_auc,
-        "false_positive_rate": fpr,
-        "confusion_matrix": cm.tolist(),
+        "accuracy": float(acc),
+        "precision_macro": float(p_mac), "recall_macro": float(r_mac),
+        "f1_macro": float(f_mac),
+        "precision_weighted": float(p_wtd), "recall_weighted": float(r_wtd),
+        "f1_weighted": float(f_wtd),
+        "per_class": per_class,
     }
 
 
-def evaluate_lstm(model, X_test, y_test, outdir):
-    le = LabelEncoder()
-    y_test_enc = le.fit_transform(y_test)
-    num_classes = len(le.classes_)
-
-    y_prob = model.predict(X_test, verbose=0)
-    y_pred = np.argmax(y_prob, axis=1)
-
-    cm = confusion_matrix(y_test_enc, y_pred, labels=range(num_classes))
-    f1 = f1_score(y_test_enc, y_pred, average="weighted")
-
-    if num_classes == 2:
-        roc_auc = roc_auc_score(y_test_enc, y_prob[:, 1])
-    else:
-        try:
-            roc_auc = roc_auc_score(y_test_enc, y_prob, multi_class="ovr")
-        except:
-            roc_auc = float("nan")
-
-    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else float("nan")
-
-    save_confusion_matrix(cm, le.classes_, "LSTM", outdir, "lstm_confusion_matrix.png")
-
-    return {
-        "model": "lstm",
-        "f1_score": f1,
-        "roc_auc": roc_auc,
-        "false_positive_rate": fpr,
-        "confusion_matrix": cm.tolist(),
-    }
-
-
-def evaluate_autoencoder(model, X_test, y_test, threshold, scaler, outdir):
-    y_test_bin = np.array([0 if l == "NORMAL" else 1 for l in y_test])
-
-    reconstructions = model.predict(X_test, verbose=0)
-    errors = np.mean(np.square(X_test - reconstructions), axis=1)
-    y_pred = (errors > threshold).astype(int)
-
-    cm = confusion_matrix(y_test_bin, y_pred)
-    f1 = f1_score(y_test_bin, y_pred, average="binary")
-
-    roc_auc = float("nan")
-    try:
-        roc_auc = roc_auc_score(y_test_bin, errors)
-    except:
-        pass
-
-    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else float("nan")
-
-    save_confusion_matrix(cm, ["NORMAL", "ANOMALY"], "Autoencoder", outdir, "ae_confusion_matrix.png")
-
-    return {
-        "model": "autoencoder",
-        "f1_score": f1,
-        "roc_auc": roc_auc,
-        "false_positive_rate": fpr,
-        "confusion_matrix": cm.tolist(),
-    }
-
-
-def save_confusion_matrix(cm, labels, title, outdir, filename):
+def save_cm(cm, labels, title, run_dir, name):
+    pd.DataFrame(cm, index=[f"true_{l}" for l in labels],
+                 columns=[f"pred_{l}" for l in labels]).to_csv(
+        os.path.join(run_dir, f"confusion_matrix_{name}.csv"))
     fig, ax = plt.subplots(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels, ax=ax)
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=labels, yticklabels=labels, ax=ax)
     ax.set_title(f"{title} - Confusion Matrix")
     ax.set_ylabel("True")
     ax.set_xlabel("Predicted")
     plt.tight_layout()
-    path = os.path.join(outdir, filename)
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"[+] Saved: {path}", file=sys.stderr)
+    fig.savefig(os.path.join(run_dir, f"confusion_matrix_{name}.png"), dpi=150)
+    plt.close(fig)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", required=True, help="Models directory")
-    parser.add_argument("--data", required=True, help="Labeled flows CSV (full dataset)")
+    parser.add_argument("--data", default=None, help="Labeled flows CSV (full dataset)")
     args = parser.parse_args()
 
-    print(f"[*] Loading data: {args.data}", file=sys.stderr)
-    df = pd.read_csv(args.data)
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.abspath(os.path.join(RESULTS_DIR, f"run_{run_ts}"))
+    os.makedirs(run_dir, exist_ok=True)
 
-    feature_cols = [
-        "duration", "total_packets", "total_bytes",
-        "fwd_packets", "bwd_packets", "fwd_bytes", "bwd_bytes",
-        "mean_pkt_len", "std_pkt_len", "mean_iat", "std_iat",
-        "pkts_per_sec", "bytes_per_sec", "uncommon_port", "dst_ip_entropy",
-    ]
-    available_features = [c for c in feature_cols if c in df.columns]
+    print("[*] Loading saved artifacts...", file=sys.stderr)
+    scaler, le, threshold, models = load_artifacts(args.outdir)
+    label_mapping = {str(c): int(i) for i, c in enumerate(le.classes_)}
 
-    scaler_path = os.path.join(args.outdir, "scaler.joblib")
-    holdout_path = os.path.join(args.outdir, "holdout_test_set.csv")
+    test_part, y_test = get_test_set(args, args.outdir)
+    X_test_scaled = scaler.transform(test_part[FEATURE_COLS].values.astype(np.float64))
+    print(f"[*] Test flows: {len(test_part)}", file=sys.stderr)
 
-    if os.path.exists(holdout_path):
-        print(f"[*] Using holdout test set: {holdout_path}", file=sys.stderr)
-        holdout = pd.read_csv(holdout_path)
-        X_test = holdout[available_features].values
-        y_test = holdout["label"].values
-    else:
-        print("[*] No holdout set found -- using full dataset split", file=sys.stderr)
-        X = df[available_features].values
-        y = df["label"].values
-        _, X_test, _, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
+    summary = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "random_seed": RANDOM_STATE,
+        "split": {"training_percentage": int((1 - TEST_SIZE) * 100),
+                  "testing_percentage": int(TEST_SIZE * 100), "stratified": True},
+        "feature_count": len(FEATURE_COLS),
+        "feature_names": list(FEATURE_COLS),
+        "training_samples": None,
+        "testing_samples": int(len(test_part)),
+        "label_mapping": label_mapping,
+        "lstm_sequence_length": SEQ_LEN,
+        "autoencoder_threshold": float(threshold),
+        "models": {},
+    }
 
-    if os.path.exists(scaler_path):
-        scaler = joblib.load(scaler_path)
-        X_test_scaled = scaler.transform(X_test)
-    else:
-        scaler = StandardScaler()
-        X_test_scaled = scaler.fit_transform(X_test)
+    report_rows = []
 
-    models = load_models(args.outdir)
-    threshold = load_threshold(args.outdir)
-
-    results = []
-
+    # ---------------- Random Forest ----------------
     if "random_forest" in models:
         print("[*] Evaluating Random Forest...", file=sys.stderr)
-        res = evaluate_rf(models["random_forest"], X_test_scaled, y_test, args.outdir)
-        results.append(res)
+        rf = models["random_forest"]
+        y_pred = rf.predict(X_test_scaled)
+        m = classification_dict(y_test, y_pred, le)
+        cm = confusion_matrix(y_test, y_pred, labels=le.classes_)
+        save_cm(cm, le.classes_, "Random Forest", run_dir, "random_forest")
+        summary["models"]["random_forest"] = m
+        for cls, vals in m["per_class"].items():
+            report_rows.append({"model": "random_forest", "class": cls,
+                                **{k: v for k, v in vals.items()}})
+        report_rows.append({"model": "random_forest", "class": "MACRO",
+                            "precision": m["precision_macro"], "recall": m["recall_macro"],
+                            "f1": m["f1_macro"], "support": len(y_test)})
+        report_rows.append({"model": "random_forest", "class": "WEIGHTED",
+                            "precision": m["precision_weighted"], "recall": m["recall_weighted"],
+                            "f1": m["f1_weighted"], "support": len(y_test)})
 
+    # ---------------- LSTM ----------------
+    lstm_info = None
     if "lstm" in models:
-        print("[*] Building LSTM sequences for evaluation...", file=sys.stderr)
-        lstm_data = df[[c for c in df.columns if c in available_features] + ["src_ip", "start_time", "label"]].copy()
-        lstm_data = lstm_data.dropna(subset=available_features)
-        seqs = []
-        seq_labels = []
-        for src_ip, group in lstm_data.groupby("src_ip"):
-            group = group.sort_values("start_time")
-            for i in range(len(group) - 5 + 1):
-                seq = group.iloc[i : i + 5]
-                last_label = seq["label"].iloc[-1]
-                X_vals = seq[available_features].values.astype(np.float64)
-                seqs.append(X_vals)
-                seq_labels.append(last_label)
-        if len(seqs) >= 20:
-            all_labels = sorted(set(seq_labels))
-            label_map = {l: i for i, l in enumerate(all_labels)}
-            label_ids = np.array([label_map[l] for l in seq_labels])
-            _, X_lstm_test, _, y_lstm_test_ids = train_test_split(
-                np.array(seqs), label_ids, test_size=0.2, random_state=42
-            )
-            y_lstm_test_labels = np.array([all_labels[i] for i in y_lstm_test_ids])
-            res = evaluate_lstm(
-                models["lstm"], X_lstm_test, y_lstm_test_labels, args.outdir
-            )
-            results.append(res)
-        else:
-            print("[!] Not enough LSTM sequences for evaluation", file=sys.stderr)
+        print("[*] Building LSTM TEST sequences from test partition only...", file=sys.stderr)
+        X_seq, y_lab = build_sequences(test_part, scaler=scaler)
+        lstm_info = {"sequence_length": SEQ_LEN,
+                     "test_sequences": int(len(X_seq)),
+                     "sequence_class_distribution": {
+                         str(k): int(v) for k, v in pd.Series(y_lab).value_counts().items()}
+                     if len(y_lab) else {}}
+        summary["lstm_testing_sequences"] = int(len(X_seq))
+        if len(X_seq) > 0:
+            y_ids = le.transform(y_lab)
+            prob = models["lstm"].predict(X_seq, verbose=0)
+            y_pred_ids = np.argmax(prob, axis=1)
+            y_true_labels = le.classes_[y_ids]
+            y_pred_labels = le.classes_[y_pred_ids]
+            m = classification_dict(y_true_labels, y_pred_labels, le)
+            cm = confusion_matrix(y_true_labels, y_pred_labels, labels=le.classes_)
+            save_cm(cm, le.classes_, "LSTM", run_dir, "lstm")
+            summary["models"]["lstm"] = m
+            for cls, vals in m["per_class"].items():
+                report_rows.append({"model": "lstm", "class": cls,
+                                    **{k: v for k, v in vals.items()}})
+            report_rows.append({"model": "lstm", "class": "MACRO",
+                                "precision": m["precision_macro"], "recall": m["recall_macro"],
+                                "f1": m["f1_macro"], "support": len(y_true_labels)})
+            report_rows.append({"model": "lstm", "class": "WEIGHTED",
+                                "precision": m["precision_weighted"], "recall": m["recall_weighted"],
+                                "f1": m["f1_weighted"], "support": len(y_true_labels)})
 
-    if "autoencoder" in models and threshold is not None:
-        print("[*] Evaluating Autoencoder...", file=sys.stderr)
-        res = evaluate_autoencoder(
-            models["autoencoder"], X_test_scaled, y_test, threshold, scaler, args.outdir
-        )
-        results.append(res)
+    # ---------------- Autoencoder ----------------
+    if "autoencoder" in models:
+        print("[*] Evaluating Autoencoder with SAVED threshold...", file=sys.stderr)
+        ae = models["autoencoder"]
+        recon = ae.predict(X_test_scaled, verbose=0)
+        errors = np.mean(np.square(X_test_scaled - recon), axis=1)
+        y_bin_true = np.array([0 if l == "NORMAL" else 1 for l in y_test])
+        y_bin_pred = (errors > threshold).astype(int)
+        acc = accuracy_score(y_bin_true, y_bin_pred)
+        prec = precision_score(y_bin_true, y_bin_pred, zero_division=0)
+        rec = recall_score(y_bin_true, y_bin_pred, zero_division=0)
+        f1b = f1_score(y_bin_true, y_bin_pred, zero_division=0)
+        cm = confusion_matrix(y_bin_true, y_bin_pred, labels=[0, 1])
+        save_cm(cm, ["NORMAL", "ANOMALY"], "Autoencoder", run_dir, "autoencoder")
+        m = {"accuracy": float(acc), "precision_binary_anomaly": float(prec),
+             "recall_binary_anomaly": float(rec), "f1_binary_anomaly": float(f1b),
+             "confusion_matrix": {"tn": int(cm[0, 0]), "fp": int(cm[0, 1]),
+                                  "fn": int(cm[1, 0]), "tp": int(cm[1, 1])}}
+        summary["models"]["autoencoder"] = m
+        report_rows.append({"model": "autoencoder", "class": "ANOMALY(binary)",
+                            "precision": float(prec), "recall": float(rec),
+                            "f1": float(f1b), "support": int((y_bin_true == 1).sum())})
+        report_rows.append({"model": "autoencoder", "class": "NORMAL(binary)",
+                            "precision": precision_score(1 - y_bin_true, 1 - y_bin_pred, zero_division=0),
+                            "recall": recall_score(1 - y_bin_true, 1 - y_bin_pred, zero_division=0),
+                            "f1": f1_score(1 - y_bin_true, 1 - y_bin_pred, zero_division=0),
+                            "support": int((y_bin_true == 0).sum())})
 
-    results_df = pd.DataFrame(results)
-    results_csv = os.path.join(args.outdir, "evaluation_results.csv")
-    results_df.to_csv(results_csv, index=False)
-    print(f"[+] Saved: {results_csv}", file=sys.stderr)
-    print(results_df.to_string(), file=sys.stderr)
+    # ---------------- Persist results ----------------
+    flat = []
+    for name, m in summary["models"].items():
+        row = {"model": name}
+        for k, v in m.items():
+            if isinstance(v, dict):
+                continue
+            row[k] = v
+        flat.append(row)
+    pd.DataFrame(flat).to_csv(os.path.join(run_dir, "evaluation_results.csv"), index=False)
+    pd.DataFrame(report_rows).to_csv(os.path.join(run_dir, "classification_report.csv"),
+                                     index=False)
 
+    train_meta_path = os.path.join(args.outdir, "training_metadata.json")
+    if os.path.exists(train_meta_path):
+        with open(train_meta_path) as f:
+            meta = json.load(f)
+        summary["training_samples"] = meta.get("training_flows",
+                                               summary["training_samples"])
+        summary["lstm_training_sequences"] = meta.get("lstm_training_sequences")
+        summary["dataset_statistics"] = {
+            "total_flows": meta.get("total_flows"),
+            "class_distribution_total": meta.get("class_distribution_total"),
+            "class_distribution_train": meta.get("class_distribution_train"),
+            "class_distribution_test": meta.get("class_distribution_test"),
+        }
+    with open(os.path.join(run_dir, "evaluation_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # Copy canonical files to results/ root
+    for fname in ["evaluation_results.csv", "classification_report.csv",
+                  "evaluation_summary.json",
+                  "confusion_matrix_random_forest.csv",
+                  "confusion_matrix_lstm.csv", "confusion_matrix_autoencoder.csv",
+                  "confusion_matrix_random_forest.png",
+                  "confusion_matrix_lstm.png", "confusion_matrix_autoencoder.png"]:
+        src = os.path.join(run_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(RESULTS_DIR, fname))
+
+    write_thesis_results(summary, run_dir)
+    shutil.copy2(os.path.join(run_dir, "thesis_results.md"),
+                 os.path.join(RESULTS_DIR, "thesis_results.md"))
+
+    print(f"[+] Results saved: {run_dir}", file=sys.stderr)
+    print(json.dumps({k: v for k, v in summary["models"].items()}, indent=2),
+          file=sys.stderr)
     print("[+] Evaluation complete", file=sys.stderr)
+
+
+def write_thesis_results(summary, run_dir):
+    def pct(x):
+        return f"{x:.4f}"
+
+    lines = ["# Thesis-Ready Results (auto-generated)", ""]
+    ds = summary.get("dataset_statistics", {})
+    lines += [
+        "## Dataset",
+        f"- Total labelled flows: {ds.get('total_flows', 'n/a')}",
+        f"- Training flows: {summary['training_samples']}",
+        f"- Test flows: {summary['testing_samples']}",
+        f"- Classes ({len(summary['label_mapping'])}): "
+        f"{json.dumps(ds.get('class_distribution_total', {}))}",
+        f"- Class distribution (train): {json.dumps(ds.get('class_distribution_train', {}))}",
+        f"- Class distribution (test): {json.dumps(ds.get('class_distribution_test', {}))}",
+        f"- Features ({summary['feature_count']}): {', '.join(summary['feature_names'])}",
+        "",
+    ]
+    for model in ["random_forest", "lstm"]:
+        if model not in summary["models"]:
+            continue
+        m = summary["models"][model]
+        title = "Random Forest" if model == "random_forest" else "LSTM"
+        lines += [f"## {title}", f"- Accuracy: {pct(m['accuracy'])}",
+                  f"- Precision (macro): {pct(m['precision_macro'])}",
+                  f"- Recall (macro): {pct(m['recall_macro'])}",
+                  f"- Macro F1: {pct(m['f1_macro'])}",
+                  f"- Weighted F1: {pct(m['f1_weighted'])}",
+                  "- Per-class:"]
+        for cls, v in m["per_class"].items():
+            lines.append(f"  - {cls}: precision={v['precision']:.4f}, "
+                         f"recall={v['recall']:.4f}, f1={v['f1']:.4f}, "
+                         f"support={v['support']}")
+        lines.append("")
+    if "lstm" in summary["models"]:
+        lines += ["- Sequence length: " + str(summary["lstm_sequence_length"]),
+                  "- Training sequences: " + str(summary.get("lstm_training_sequences")),
+                  "- Test sequences: " + str(summary.get("lstm_testing_sequences")), ""]
+    if "autoencoder" in summary["models"]:
+        a = summary["models"]["autoencoder"]
+        c = a["confusion_matrix"]
+        lines += ["## Autoencoder",
+                  f"- Threshold: {summary['autoencoder_threshold']:.6g} "
+                  "(mean + 3*std of training-normal reconstruction error)",
+                  f"- Accuracy: {pct(a['accuracy'])}",
+                  f"- Precision (anomaly): {pct(a['precision_binary_anomaly'])}",
+                  f"- Recall (anomaly): {pct(a['recall_binary_anomaly'])}",
+                  f"- F1 (anomaly): {pct(a['f1_binary_anomaly'])}",
+                  f"- Confusion matrix: TN={c['tn']} FP={c['fp']} FN={c['fn']} TP={c['tp']}",
+                  ""]
+    with open(os.path.join(run_dir, "thesis_results.md"), "w") as f:
+        f.write("\n".join(lines))
 
 
 if __name__ == "__main__":
