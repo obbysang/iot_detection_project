@@ -8,16 +8,19 @@ mapping, NEVER recomputes the Autoencoder threshold.
 Outputs all results into results/run_YYYYMMDD_HHMMSS/ and copies the
 canonical result files to results/.
 """
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import argparse
 import json
-import os
 import shutil
 import sys
 from datetime import datetime, timezone
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 
 import matplotlib
 matplotlib.use("Agg")
@@ -34,7 +37,7 @@ from sklearn.metrics import (
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_common import (
     FEATURE_COLS, LABEL_COL, RANDOM_STATE, SEQ_LEN, TEST_SIZE,
-    load_labeled_data, make_split, build_sequences,
+    load_labeled_data, make_split, make_event_level_split, build_sequences,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
@@ -63,11 +66,26 @@ def load_artifacts(outdir):
 
 
 def get_test_set(args, outdir):
-    """Return (X_test_df_rows, y_test) using the saved holdout partition."""
-    df = None
+    """Return (X_test_df_rows, y_test) using the saved holdout partition.
+
+    Reads the split_mode from training_metadata.json to reproduce the
+    exact same split used during training.
+    """
+    # Determine split mode from training metadata
+    meta_path = os.path.join(outdir, "training_metadata.json")
+    split_mode = "stratified"
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        split_mode = meta.get("split_mode", "stratified")
+
     if getattr(args, "data", None):
         df = load_labeled_data(args.data)
-        train_idx, test_idx = make_split(df)  # deterministic reproduction
+        if split_mode == "event_level":
+            print("[*] Reproducing EVENT-LEVEL split", file=sys.stderr)
+            train_idx, test_idx = make_event_level_split(df)
+        else:
+            train_idx, test_idx = make_split(df)
         test_part = df.loc[test_idx]
         holdout_path = os.path.join(outdir, "holdout_test_set.csv")
         if os.path.exists(holdout_path):

@@ -10,14 +10,18 @@ Corrected evaluation methodology:
   - Autoencoder trained on TRAINING normal flows only; threshold =
     mean + 3*std of reconstruction errors on those same training flows
 """
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress all TF info/warning/err
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 
 import numpy as np
 import pandas as pd
@@ -29,7 +33,8 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_common import (
     FEATURE_COLS, LABEL_COL, RANDOM_STATE, SEQ_LEN,
-    load_labeled_data, make_split, build_sequences, save_label_encoder,
+    load_labeled_data, make_split, make_event_level_split,
+    build_sequences, save_label_encoder,
 )
 
 
@@ -71,7 +76,7 @@ def train_lstm(X_train_seq, y_train_seq, num_classes):
     ])
     model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
-    model.fit(X_train_seq, y_train_seq, epochs=20, batch_size=16,
+    model.fit(X_train_seq, y_train_seq, epochs=20, batch_size=64,
               validation_split=0.1, verbose=0)
     return model
 
@@ -104,6 +109,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="Path to labeled flows CSV")
     parser.add_argument("--outdir", required=True, help="Output directory for models")
+    parser.add_argument("--split-mode", choices=["stratified", "event_level"],
+                        default="stratified",
+                        help="Split mode: stratified (default) or event_level")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -114,8 +122,13 @@ def main():
     class_dist = df[LABEL_COL].value_counts().to_dict()
     print(f"[+] {n_total} flows; class distribution: {class_dist}", file=sys.stderr)
 
-    # ---- Split FIRST (stratified, deterministic) ----
-    train_idx, test_idx = make_split(df)
+    # ---- Split FIRST ----
+    if args.split_mode == "event_level":
+        print("[*] Using EVENT-LEVEL split (attack runs → train/test)", file=sys.stderr)
+        train_idx, test_idx = make_event_level_split(df)
+    else:
+        print("[*] Using STRATIFIED 80/20 split", file=sys.stderr)
+        train_idx, test_idx = make_split(df)
     y_all = df[LABEL_COL].values
     X_train = df.loc[train_idx, FEATURE_COLS].values.astype(np.float64)
     X_test = df.loc[test_idx, FEATURE_COLS].values.astype(np.float64)
@@ -140,11 +153,27 @@ def main():
     # Persist holdout test set so evaluate.py uses exactly this partition.
     df.loc[test_idx].to_csv(os.path.join(args.outdir, "holdout_test_set.csv"), index=False)
 
-    metadata = {
+    # Record which attack runs are in test (for event-level split)
+    metadata = {}
+    run_col = None
+    for col in ["attack_run", "experiment_run"]:
+        if col in df.columns and df[col].notna().any():
+            run_col = col
+            break
+    if args.split_mode == "event_level" and run_col:
+        test_runs = df.loc[test_idx, run_col].unique().tolist()
+        test_runs = [r for r in test_runs if pd.notna(r) and str(r).strip()]
+        metadata["test_experiment_runs"] = test_runs
+        train_runs = df.loc[train_idx, run_col].unique().tolist()
+        train_runs = [r for r in train_runs if pd.notna(r) and str(r).strip()]
+        metadata["train_experiment_runs"] = train_runs
+
+    metadata.update({
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "random_seed": RANDOM_STATE,
+        "split_mode": args.split_mode,
         "test_size": 0.2,
-        "stratified": True,
+        "stratified": args.split_mode == "stratified",
         "feature_count": len(FEATURE_COLS),
         "features": list(FEATURE_COLS),
         "label_mapping": label_mapping,
@@ -157,9 +186,9 @@ def main():
         "lstm_sequence_length": SEQ_LEN,
         "rf_params": {"n_estimators": 200, "max_depth": 20,
                       "min_samples_split": 5, "class_weight": "balanced"},
-        "lstm_params": {"units": 64, "dense": 32, "epochs": 20, "batch_size": 16},
+        "lstm_params": {"units": 64, "dense": 32, "epochs": 20, "batch_size": 64},
         "ae_params": {"layers": [16, 8, 16], "epochs": 30, "batch_size": 16},
-    }
+    })
 
     # ---- Random Forest (train partition only) ----
     rf = train_random_forest(X_train_scaled, y_train)
@@ -185,6 +214,15 @@ def main():
         str(k): int(v) for k, v in pd.Series(y_te_lab).value_counts().items()} if len(y_te_lab) else {}
 
     if len(X_tr_seq) >= 20 and len(np.unique(y_tr_ids)) > 1:
+        # Subsample if too many sequences for available memory
+        MAX_SEQ = 50000
+        if len(X_tr_seq) > MAX_SEQ:
+            rng = np.random.RandomState(RANDOM_STATE)
+            keep = rng.choice(len(X_tr_seq), MAX_SEQ, replace=False)
+            X_tr_seq = X_tr_seq[keep]
+            y_tr_ids = y_tr_ids[keep]
+            print(f"[+] Subsampled LSTM training to {MAX_SEQ} sequences for memory",
+                  file=sys.stderr)
         lstm_model = train_lstm(X_tr_seq, y_tr_ids, num_classes=len(le.classes_))
         if lstm_model is not None:
             lstm_model.save(os.path.join(args.outdir, "lstm_model.keras"))

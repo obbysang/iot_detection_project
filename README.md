@@ -2,6 +2,44 @@
 
 Defensive security research lab — simulates an IoT network with normal and attack traffic, extracts flow features, and trains ML models (Random Forest, LSTM, Autoencoder) for intrusion detection. Built for MSc Cybersecurity.
 
+## Prerequisites
+
+- **Docker Desktop** (with Docker Compose V2)
+- **Python 3.11+** (3.12 recommended for Windows)
+- **Node.js 18+** with **pnpm** (for dashboard frontend build)
+- **Git Bash** or WSL (for shell scripts on Windows)
+- **4 GB+ RAM** available for Docker and TensorFlow
+
+## Quick Start
+
+```bash
+# 1. Clone the repo
+git clone <repo-url> && cd iot_detection_project
+
+# 2. Create Python venv and install dependencies
+python3 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r ml/requirements.txt -r dashboard/server/requirements.txt
+
+# 3. Build and launch Docker containers
+docker compose build
+docker compose up -d
+
+# 4. Start the attack listener (in attacker container)
+docker exec -d attacker python3 /scripts/listener.py
+
+# 5. Build the dashboard frontend
+cd dashboard && pnpm install && pnpm build && cd ..
+
+# 6. Start the dashboard API
+uvicorn dashboard.server.main:app --host 0.0.0.0 --port 8000
+
+# 7. Open the dashboard
+# Navigate to http://localhost:8000 in your browser
+```
+
+For the full step-by-step setup with troubleshooting, see **[docs/RUNBOOK.md](docs/RUNBOOK.md)** (Linux/macOS) or **[docs/RUNBOOK-WIN.md](docs/RUNBOOK-WIN.md)** (Windows).
+
 ## Architecture
 
 ```
@@ -47,6 +85,7 @@ Defensive security research lab — simulates an IoT network with normal and att
 │   └── mqtt-broker/           # Mosquitto config
 ├── dashboard/
 │   ├── src/                   # TypeScript frontend (Chart.js)
+│   ├── dist/                  # Bundled frontend (built, gitignored)
 │   └── server/main.py         # FastAPI — data API + control endpoints
 ├── scripts/
 │   ├── normal_traffic.py      # MQTT, HTTP, ICMP inside iot-sensor
@@ -56,16 +95,28 @@ Defensive security research lab — simulates an IoT network with normal and att
 │   ├── attack_beacon.sh       # C2 beacon simulation
 │   ├── attack_exfil.sh        # Ransomware exfil simulation
 │   ├── capture_host.sh        # Host-side tcpdump on bridge interface
+│   ├── capture_rotate.sh      # Rotating tcpdump segments
+│   ├── run_experiment.py      # Full orchestrated experiment runner
 │   └── live_update.sh         # Watch pcap segments → extract → label → train
 ├── ml/
-│   ├── requirements.txt
+│   ├── requirements.txt       # Python ML dependencies
 │   ├── extract_features.py    # Pcap → bidirectional flow features
 │   ├── label_flows.py         # Label flows by attack_log.csv time intervals
+│   ├── annotate_flows.py      # Add experiment run IDs to labeled flows
+│   ├── dataset_validator.py   # Pre-training validation gate
+│   ├── data_integrity_check.py# Quantify duplicates and cross-split contamination
 │   ├── train_models.py        # Random Forest + LSTM + Autoencoder
-│   └── evaluate.py            # Confusion matrices, F1, ROC-AUC, FPR
-├── data/                      # PCAPs, CSVs, attack_log (gitignored)
+│   ├── evaluate.py            # Confusion matrices, F1, ROC-AUC, FPR
+│   └── pipeline_common.py     # Shared constants, split logic, sequence builder
 ├── models/                    # Trained .joblib / .keras / results (gitignored)
-└── docs/RUNBOOK.md            # Full setup and usage guide
+├── data/                      # PCAPs, CSVs, attack_log (gitignored)
+├── results/                   # ML evaluation results (tracked)
+│   ├── evaluation_results.csv
+│   ├── confusion_matrix_*.csv
+│   └── thesis_results.md
+└── docs/
+    ├── RUNBOOK.md             # Linux/macOS setup guide
+    └── RUNBOOK-WIN.md         # Windows/PowerShell setup guide
 ```
 
 ## Data Flow
@@ -79,45 +130,49 @@ Defensive security research lab — simulates an IoT network with normal and att
 7. **Evaluation** — `evaluate.py` generates confusion matrices, weighted F1 scores, and ROC-AUC metrics → `models/evaluation_results.csv`
 8. **Dashboard** — The FastAPI backend serves KPIs, flow table, timeline chart, and event stream from these CSVs in near real-time
 
-## Quick Start
+## Running the Experiment
 
-See **[docs/RUNBOOK.md](docs/RUNBOOK.md)** for the complete step-by-step setup. It includes:
-
-- Required bug patches (timezone parsing, numpy/scapy compatibility)
-- Directory permission fixes
-- Container launch
-- Capture loop, traffic generation, and ML pipeline
-- Running attacks and viewing labeled results
-- Training and evaluating models
+### Automated (full pipeline)
 
 ```bash
-# Minimal preview (after RUNBOOK steps 1-9):
-git clone <repo> && cd iot_detection_project
-# apply patches in ml/label_flows.py and ml/extract_features.py
-chmod 777 data data/segments
-python3 -m venv venv && source venv/bin/activate && pip install -r ml/requirements.txt -r dashboard/server/requirements.txt
-docker compose build && docker compose up -d
-docker exec -d attacker python3 /scripts/listener.py
-cd dashboard && pnpm install && pnpm build && cd ..
-uvicorn dashboard.server.main:app --host 0.0.0.0 --port 8000
-# ... then capture, pipeline, and attacks (see RUNBOOK)
+# Run 3 full experiment repetitions
+python scripts/run_experiment.py --repetitions 3
 ```
 
-## Key Fixes (as of Jul 2026)
+### Manual (step by step)
 
-| Issue | File | Fix |
-|---|---|---|
-| All flows labeled NORMAL | `ml/label_flows.py` | Parse attack timestamps as timezone-aware UTC |
-| Pipeline crash on pcap read | `ml/extract_features.py` | Cast `p.time` to `float` before numpy |
-| tcpdump -G rotation mismatch | `scripts/live_update.sh` | Rewrote to track files by name, skip in-progress |
-| Permission denied for containers | `data/` `data/segments/` | `chmod 777` |
-| train_models StringArray crash | `ml/train_models.py` | Split on `df.index` instead of y_test.index |
-| evaluate autoencoder multiclass | `ml/evaluate.py` | Binarize labels for anomaly detection |
-Add new wheels and scripts for live updates and capture rotation
+```bash
+# Start capture (on host, after containers are up)
+bash scripts/capture_rotate.sh
 
-- Added various Python wheel packages including absl_py, astunparse, certifi, and many others to the ml/wheels directory.
-- Introduced capture_rotate.sh script for capturing network traffic using tcpdump with automatic segment rotation.
-- Implemented live_update.sh script to monitor new PCAP segments, extract features, label flows, and retrain models automatically.
+# In another terminal — start the live pipeline (watches for new segments)
+bash scripts/live_update.sh --train-every 5
+
+# Trigger attacks (via dashboard buttons or CLI)
+docker exec attacker bash /scripts/attack_recon.sh
+docker exec attacker bash /scripts/attack_bruteforce.sh
+docker exec attacker bash /scripts/attack_beacon.sh
+docker exec attacker bash /scripts/attack_exfil.sh
+
+# Train models manually
+python ml/train_models.py --data data/labeled_flows.csv --outdir models/
+
+# Evaluate
+python ml/evaluate.py --outdir models/ --data data/labeled_flows.csv
+```
+
+## Dashboard
+
+The web dashboard provides a real-time view of network activity:
+
+- **KPI cards** — Total flows, attack count, detection rate
+- **Flow table** — Sortable/filterable table of all detected flows
+- **Timeline chart** — Network activity over time with attack markers
+- **Event stream** — Live feed of detected events (SSE)
+
+The frontend is built with TypeScript + Chart.js and bundled with esbuild. The backend is FastAPI serving REST + SSE endpoints.
+
+
 ## License
 
 MSc project — use freely for educational and research purposes.
